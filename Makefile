@@ -23,10 +23,6 @@ include ${MK_DIR}/astaire.mk
 
 build: ${SUBMODULES} astaire
 
-test: ${SUBMODULES} astaire_test
-
-testall: $(patsubst %, %_test, ${SUBMODULES}) test
-
 clean: $(patsubst %, %_clean, ${SUBMODULES}) astaire_clean
 	rm -rf ${ROOT}/usr
 	rm -rf ${ROOT}/build
