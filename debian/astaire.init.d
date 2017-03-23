@@ -56,7 +56,7 @@ PATH=/sbin:/usr/sbin:/bin:/usr/bin
 DESC="Astaire Active Resynchronization Daemon"
 NAME=astaire
 EXECNAME=astaire
-PIDFILE=/var/run/$NAME.pid
+PIDFILE=/var/run/$NAME/$NAME.pid
 DAEMON=/usr/share/clearwater/bin/astaire
 HOME=/etc/clearwater
 log_directory=/var/log/$NAME
@@ -98,6 +98,10 @@ do_start()
         #   0 if daemon has been started
         #   1 if daemon was already running
         #   2 if daemon could not be started
+
+        # Allow us to write to the pidfile directory
+        install -m 755 -o $NAME -g root -d /var/run/$NAME && chown -R $NAME /var/run/$NAME
+
         start-stop-daemon --start --quiet --pidfile $PIDFILE --exec $DAEMON --test > /dev/null \
                 || return 1
 
@@ -112,10 +116,36 @@ do_start()
         DAEMON_ARGS="--local-name=$local_ip:11211
                      --cluster-settings-file=/etc/clearwater/cluster_settings
                      --log-file=$log_directory
-                     --log-level=$log_level
-                     --alarms-enabled"
+                     --log-level=$log_level"
 
-        $namespace_prefix start-stop-daemon --start --quiet --background --make-pidfile --pidfile $PIDFILE --exec $DAEMON --chuid $NAME --chdir $HOME --nicelevel 10 -- $DAEMON_ARGS \
+        $namespace_prefix start-stop-daemon --start --quiet --pidfile $PIDFILE --exec $DAEMON --chuid $NAME --chdir $HOME --nicelevel 10 -- $DAEMON_ARGS --daemon --pidfile=$PIDFILE \
+                || return 2
+        # Add code here, if necessary, that waits for the process to be ready
+        # to handle requests from services started subsequently which depend
+        # on this one.  As a last resort, sleep for some time.
+}
+
+#
+# Function that runs the daemon/service in the foreground
+#
+do_run()
+{
+        # Allow us to write to the pidfile directory
+        install -m 755 -o $NAME -g root -d /var/run/$NAME && chown -R $NAME /var/run/$NAME
+
+        export LD_LIBRARY_PATH=/usr/share/clearwater/astaire/lib
+        ulimit -Hn 1000000
+        ulimit -Sn 1000000
+        ulimit -c unlimited
+        # enable gdb to dump a parent astaire process's stack
+        echo 0 > /proc/sys/kernel/yama/ptrace_scope
+        get_settings
+        DAEMON_ARGS="--local-name=$local_ip:11211
+                     --cluster-settings-file=/etc/clearwater/cluster_settings
+                     --log-file=$log_directory
+                     --log-level=$log_level"
+
+        $namespace_prefix start-stop-daemon --start --quiet --pidfile $PIDFILE --exec $DAEMON --chuid $NAME --chdir $HOME --nicelevel 10 -- $DAEMON_ARGS --pidfile=$PIDFILE \
                 || return 2
         # Add code here, if necessary, that waits for the process to be ready
         # to handle requests from services started subsequently which depend
@@ -134,17 +164,6 @@ do_stop()
         #   other if a failure occurred
         start-stop-daemon --stop --quiet --retry=TERM/30/KILL/5 --pidfile $PIDFILE --name $EXECNAME
         RETVAL="$?"
-        [ "$RETVAL" = 2 ] && return 2
-        # Wait for children to finish too if this is a daemon that forks
-        # and if the daemon is only ever run from this initscript.
-        # If the above conditions are not satisfied then add some other code
-        # that waits for the process to drop all resources that could be
-        # needed by services started subsequently.  A last resort is to
-        # sleep for some time.
-        #start-stop-daemon --stop --quiet --oknodo --retry=0/30/KILL/5 --exec $DAEMON
-        #[ "$?" = 2 ] && return 2
-        # Many daemons don't delete their pidfiles when they exit.
-        rm -f $PIDFILE
         return "$RETVAL"
 }
 
@@ -163,9 +182,11 @@ do_abort()
         #   other if a failure occurred
         start-stop-daemon --stop --quiet --retry=ABRT/60/KILL/5 --pidfile $PIDFILE --name $EXECNAME
         RETVAL="$?"
-        [ "$RETVAL" = 2 ] && return 2
-        # Many daemons don't delete their pidfiles when they exit.
-        rm -f $PIDFILE
+        # If the abort failed, it may be because the PID in PIDFILE doesn't match the right process
+        # In this window condition, we may not recover, so remove the PIDFILE to get it running
+        if [ $RETVAL != 0 ]; then
+          rm -f $PIDFILE
+        fi
         return "$RETVAL"
 }
 
@@ -191,20 +212,53 @@ do_wait_sync() {
 
         # Query astaire via the 0MQ socket, parse out the number of buckets
         # needing resync and check if it's 0.  If not, wait for 5s and try again.
+        num_cycles_unchanged=0
         while true
         do
-                # Retrieve the statistics.
-                stats="`/usr/share/clearwater/astaire/bin/cw_stat astaire astaire_global |
-                       egrep '(buckets(NeedingResync|Resynchronized)|entriesResynchronized)' |
-                       cut -d: -f2`"
-                bucket_need_resync=`echo $stats | cut -d\  -f1`
-                bucket_resynchronized=`echo $stats | cut -d\  -f2`
-                entry_resynchronized=`echo $stats | cut -d\  -f3`
+                # Retrieve the statistics. Check that we got the statistics from Astaire -
+                # if we didn't then Astaire probably isn't running, and there's no use
+                # waiting for it to sync.
+                stats=$(/usr/share/clearwater/astaire/bin/cw_stat astaire astaire_global)
+                if [ $? != 0 ]
+                then
+                  logger astaire: Wait sync aborting as unable to get statistics from Astaire
+                  break
+                fi
+
+                parsed_stats=$(echo "$stats" |
+                               egrep '(buckets(NeedingResync|Resynchronized)|entriesResynchronized)' |
+                               cut -d: -f2)
+
+                bucket_need_resync=`echo $parsed_stats | cut -d\  -f1`
+                bucket_resynchronized=`echo $parsed_stats | cut -d\  -f2`
+                entry_resynchronized=`echo $parsed_stats | cut -d\  -f3`
 
                 # If the number of buckets needing resync is 0, we're finished
                 if [ "$bucket_need_resync" = "0" ]
                 then
-                	break
+                  break
+                fi
+
+                # If the number of buckets needing resync hasn't changed for the last 120 cycles (i.e.
+                # over the last 10 minutes), make a syslog and stop waiting.  We don't
+                # expect resyncs to take more than 10 minutes in normal operation, so this
+                # suggests that local service has failed  We need to
+                # end the wait in this case as the potential service impact of aborting
+                # the wait early is far outweighed by the impact on management operations
+                # of an infinite wait.
+                if [ "$bucket_need_resync" = "$last_bucket_need_resync" ]
+                then
+                  num_cycles_unchanged=$(( $num_cycles_unchanged + 1 ))
+
+                  if [ $num_cycles_unchanged -ge 120 ]
+                  then
+                    logger astaire: Wait sync aborting as unsynced bucket count apparently stuck at $bucket_need_resync
+                    break
+                  fi
+
+                else
+                  last_bucket_need_resync=$bucket_need_resync
+                  num_cycles_unchanged=0
                 fi
 
                 # If we have numeric statistics, display them.
@@ -246,6 +300,14 @@ case "$1" in
   start)
         [ "$VERBOSE" != no ] && log_daemon_msg "Starting $DESC" "$NAME"
         do_start
+        case "$?" in
+                0|1) [ "$VERBOSE" != no ] && log_end_msg 0 ;;
+                2) [ "$VERBOSE" != no ] && log_end_msg 1 ;;
+        esac
+        ;;
+  run)
+        [ "$VERBOSE" != no ] && log_daemon_msg "Running $DESC" "$NAME"
+        do_run
         case "$?" in
                 0|1) [ "$VERBOSE" != no ] && log_end_msg 0 ;;
                 2) [ "$VERBOSE" != no ] && log_end_msg 1 ;;
@@ -316,7 +378,7 @@ case "$1" in
         do_full_resync
         ;;
   *)
-        echo "Usage: $SCRIPTNAME {start|stop|status|restart|reload|force-reload|abort-restart|wait-sync}" >&2
+        echo "Usage: $SCRIPTNAME {start|run|stop|status|restart|reload|force-reload|abort|abort-restart|wait-sync|full-resync}" >&2
         exit 3
         ;;
 esac

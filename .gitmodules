@@ -10,3 +10,9 @@
 [submodule "modules/gmock"]
 	path = modules/gmock
 	url = git@github.com:ClearwaterCore/gmock-upstream.git
+[submodule "modules/rapidjson"]
+	path = modules/rapidjson
+	url = git@github.com:miloyip/rapidjson.git
+[submodule "modules/sas-client"]
+	path = modules/sas-client
+	url = git@github.com:ClearwaterCore/sas-client.git
