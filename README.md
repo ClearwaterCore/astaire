@@ -44,6 +44,3 @@ Astaire is intended to run in the background and not interfere with the business
 
 By default the throttling service limits Astaire to 5% of the total CPU resource on the node. To change this limit, set the `astaire_cpu_limit_percentage` option in `/etc/clearwater/config` and run `sudo restart astaire-throttle`. Note that this is an advanced setting and should be used with caution - setting the limit too high can cause disruption to other services on the node.
 
-## Project Clearwater
-
-Astaire was originally written as part of [Project Clearwater](http://www.projectclearwater.org), an open-source IMS core, developed by [Metaswitch Networks](http://www.metaswitch.com/) and released under the [GNU GPLv3](http://www.projectclearwater.org/download/license/). You can find more information about it on [our website](http://www.projectclearwater.org/) or our [wiki](http://clearwater.readthedocs.org/en/latest/).
