@@ -30,6 +30,7 @@ astaire_LDFLAGS := -L../usr/lib \
                    -lpthread \
                    -lboost_filesystem \
                    -lboost_system \
+                   -lboost_regex \
                    -lrt \
                    -lzmq
 
